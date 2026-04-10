@@ -1,0 +1,34 @@
+﻿# Node / package manager
+node_modules/
+.npm/
+.pnpm-store/
+
+# Build outputs
+dist/
+coverage/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# Vite cache
+node_modules/.vite/
+
+# Misc
+*.local

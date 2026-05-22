@@ -79,3 +79,11 @@ export function LanguageIcon(props) {
     </SvgIcon>
   );
 }
+
+export function MergeVideosIcon(props) {
+  return (
+    <SvgIcon {...props}>
+      <path d="M8 7h8v3h-2.5c-.83 0-1.5.67-1.5 1.5v5H10v-5c0-.83-.67-1.5-1.5-1.5H6V7zm-2 5h2.5c.28 0 .5.22.5.5V19h6v-6.5c0-.28.22-.5.5-.5H18v-2h-2.5c-1.38 0-2.5 1.12-2.5 2.5V19H6v-4.5C6 12.12 4.88 11 3.5 11H2v1zm2-7v2h4V5H4z" />
+    </SvgIcon>
+  );
+}

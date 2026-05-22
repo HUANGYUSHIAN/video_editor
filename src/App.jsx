@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Box,
@@ -13,7 +13,6 @@ import {
   ListItemButton,
   ListItemText,
   Paper,
-  Slider,
   Snackbar,
   Stack,
   TextField,
@@ -27,6 +26,7 @@ import {
   FlagIcon,
   FolderOpenIcon,
   LanguageIcon,
+  MergeVideosIcon,
   PauseIcon,
   PlayArrowIcon,
   SaveFolderIcon,
@@ -34,6 +34,7 @@ import {
 } from './icons.jsx';
 import { isMp4Extension, suggestedMp4Name, supportsDirectoryPicker, writeFileToDirectory } from './lib/browserFs.js';
 import { exportSegmentsToMp4 } from './lib/ffmpegExport.js';
+import { mergeTwoMp4CenterPad } from './lib/ffmpegMerge.js';
 import { loadFfmpeg, terminateActiveFfmpeg } from './lib/loadFfmpeg.js';
 import {
   clampSourceToKept,
@@ -97,6 +98,16 @@ const I18N = {
     save: 'Save',
     language: 'Language',
     languageTitle: 'Choose Language',
+    mergeVideos: 'Merge two MP4 files',
+    mergePickerTitle: 'Merge videos',
+    selectVideoStep1: 'Select first video',
+    selectVideoStep2: 'Select second video',
+    mergeRun: 'Merge',
+    mergeNeedsTwo: 'Please select both MP4 files.',
+    mergeExportTitle: 'Save merged file',
+    mergeSaved: 'Merged file saved:',
+    merging: 'Merging videos',
+    mergeFailed: 'Merge failed:',
   },
   zh: {
     appInfo: '僅支援 MP4 編輯，含 inclusive / exclusive 刪除。',
@@ -151,6 +162,16 @@ const I18N = {
     save: '存檔',
     language: '語言',
     languageTitle: '選擇語言',
+    mergeVideos: '合併兩個 MP4',
+    mergePickerTitle: '合併影片',
+    selectVideoStep1: '選擇第一部影片',
+    selectVideoStep2: '選擇第二部影片',
+    mergeRun: '合併',
+    mergeNeedsTwo: '請選擇兩個 MP4 檔案。',
+    mergeExportTitle: '儲存合併結果',
+    mergeSaved: '合併檔已儲存：',
+    merging: '合併影片中',
+    mergeFailed: '合併失敗：',
   },
   ja: {
     appInfo: 'MP4専用エディタ（inclusive / exclusive 削除対応）。',
@@ -205,6 +226,16 @@ const I18N = {
     save: '保存',
     language: 'Language',
     languageTitle: '言語を選択',
+    mergeVideos: '2つの MP4 を結合',
+    mergePickerTitle: '動画を結合',
+    selectVideoStep1: '1本目の動画を選択',
+    selectVideoStep2: '2本目の動画を選択',
+    mergeRun: '結合',
+    mergeNeedsTwo: '両方の MP4 を選択してください。',
+    mergeExportTitle: '結合ファイルの保存',
+    mergeSaved: '結合ファイルを保存しました：',
+    merging: '動画を結合中',
+    mergeFailed: '結合失敗：',
   },
 };
 
@@ -251,6 +282,44 @@ function parseTimeInput(text, maxSec) {
   return null;
 }
 
+function defaultMergeOutName(fileA, fileB) {
+  const a = (fileA?.name || 'clip1').replace(/\.[^.]+$/i, '') || 'clip1';
+  const b = (fileB?.name || 'clip2').replace(/\.[^.]+$/i, '') || 'clip2';
+  const base = `${a}_${b}`.replace(/[\\/:*?"<>|]/g, '_');
+  return /\.mp4$/i.test(base) ? base : `${base}.mp4`;
+}
+
+/**
+ * @param {File} file
+ * @returns {Promise<{ width: number; height: number }>}
+ */
+function probeVideoDimensions(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const v = document.createElement('video');
+    v.preload = 'metadata';
+    v.muted = true;
+    v.playsInline = true;
+    const cleanup = () => {
+      URL.revokeObjectURL(url);
+      v.removeAttribute('src');
+      v.load();
+    };
+    v.onloadedmetadata = () => {
+      const width = v.videoWidth;
+      const height = v.videoHeight;
+      cleanup();
+      if (width > 0 && height > 0) resolve({ width, height });
+      else reject(new Error('Could not read video dimensions'));
+    };
+    v.onerror = () => {
+      cleanup();
+      reject(new Error('Could not load video metadata'));
+    };
+    v.src = url;
+  });
+}
+
 export default function App() {
   const [lang, setLang] = useState('en');
   const dict = I18N[lang] || I18N.en;
@@ -280,14 +349,27 @@ export default function App() {
   const [flagTimeText, setFlagTimeText] = useState('');
   const [snack, setSnack] = useState({ open: false, message: '' });
 
+  const [mergePickerOpen, setMergePickerOpen] = useState(false);
+  const [mergeFileA, setMergeFileA] = useState(null);
+  const [mergeFileB, setMergeFileB] = useState(null);
+  const [mergeSaveOpen, setMergeSaveOpen] = useState(false);
+  const [mergeOutFileName, setMergeOutFileName] = useState('');
+
   const exportAbortRef = useRef(null);
   const videoRef = useRef(null);
   const trackRef = useRef(null);
-  const rafRef = useRef(null);
-  const lastTsRef = useRef(null);
   const flagDragRef = useRef(null);
+  const playRafRef = useRef(null);
+  const editedTimeRef = useRef(0);
+  const sliderInputRef = useRef(null);
+  const editedTimelineLabelRef = useRef(null);
+  const sourceTimelineLabelRef = useRef(null);
 
   const totalEdited = useMemo(() => editedDuration(segments), [segments]);
+
+  useEffect(() => {
+    editedTimeRef.current = editedTime;
+  }, [editedTime]);
 
   useEffect(() => {
     if (!inputFile) {
@@ -302,19 +384,21 @@ export default function App() {
   const pickOutput = useCallback(async () => {
     if (!supportsDirectoryPicker()) {
       setSnack({ open: true, message: t(dict, 'browserNoFolder') });
-      return false;
+      return null;
     }
     try {
       const h = await window.showDirectoryPicker({ mode: 'readwrite' });
       setOutputDirHandle(h);
       setOutputDirLabel(h.name);
-      return true;
+      return h;
     } catch (e) {
-      if (e && typeof e === 'object' && 'name' in e && e.name === 'AbortError') return false;
+      if (e && typeof e === 'object' && 'name' in e && e.name === 'AbortError') return null;
       setSnack({ open: true, message: t(dict, 'openFolderFailed') });
-      return false;
+      return null;
     }
   }, [dict]);
+
+  const videoSourceKey = inputFile ? `${inputFile.name}-${inputFile.lastModified}-${inputFile.size}` : 'empty';
 
   const resetEditState = () => {
     setPlaying(false);
@@ -346,41 +430,92 @@ export default function App() {
   const syncVideoToEdited = useCallback(
     (tEdited) => {
       const v = videoRef.current;
-      if (!v || !segments.length) return;
+      if (!v || !segments.length || v.readyState < 1) return;
       const src = editedToSource(segments, tEdited);
-      if (Math.abs(v.currentTime - src) > 0.04) v.currentTime = src;
+      if (Math.abs(v.currentTime - src) > 0.04) {
+        try {
+          v.currentTime = src;
+        } catch {
+          /* ignore seek before metadata */
+        }
+      }
     },
     [segments],
   );
 
   useEffect(() => {
+    if (playing) return;
     syncVideoToEdited(editedTime);
-  }, [editedTime, syncVideoToEdited]);
+  }, [editedTime, syncVideoToEdited, playing]);
 
   useEffect(() => {
-    if (!playing) {
-      lastTsRef.current = null;
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
-      return;
+    if (playing || !sliderInputRef.current || totalEdited <= 0) return;
+    sliderInputRef.current.value = String(Math.min(editedTime, totalEdited));
+  }, [editedTime, playing, totalEdited]);
+
+  // Drive playback on the edited timeline (same mapping as the slider). Native
+  // currentTime would otherwise advance through deleted source ranges and trip
+  // "no segment" logic that stops at totalEdited.
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v || !playing || !segments.length || totalEdited <= 0) return;
+
+    const startEdited = editedTimeRef.current;
+    const startWall = performance.now();
+
+    v.muted = false;
+    v.volume = 1;
+    try {
+      v.currentTime = editedToSource(segments, startEdited);
+    } catch {
+      /* ignore seek before metadata */
     }
-    const tick = (ts) => {
-      if (!lastTsRef.current) lastTsRef.current = ts;
-      const dt = (ts - lastTsRef.current) / 1000;
-      lastTsRef.current = ts;
-      setEditedTime((prev) => {
-        const next = prev + dt;
-        if (totalEdited <= 0) return 0;
-        if (next >= totalEdited) {
-          setPlaying(false);
-          return totalEdited;
-        }
-        return next;
-      });
-      rafRef.current = requestAnimationFrame(tick);
+    v.play().catch(() => {});
+
+    const syncPlayheadUi = (tEdited) => {
+      editedTimeRef.current = tEdited;
+      const slider = sliderInputRef.current;
+      if (slider) slider.value = String(tEdited);
+      if (editedTimelineLabelRef.current) {
+        editedTimelineLabelRef.current.textContent = `${t(dict, 'editedTimeline')} ${formatHMS(tEdited)} / ${formatHMS(totalEdited)}`;
+      }
+      if (sourceTimelineLabelRef.current) {
+        const src = editedToSource(segments, tEdited);
+        sourceTimelineLabelRef.current.textContent = `${t(dict, 'sourceTimeline')} ${formatHMS(src)} / ${formatHMS(duration)}`;
+      }
     };
-    rafRef.current = requestAnimationFrame(tick);
-    return () => rafRef.current && cancelAnimationFrame(rafRef.current);
-  }, [playing, totalEdited]);
+
+    const tick = () => {
+      const elapsed = (performance.now() - startWall) / 1000;
+      let tEdited = startEdited + elapsed;
+      if (tEdited >= totalEdited) {
+        tEdited = totalEdited;
+        syncPlayheadUi(tEdited);
+        setEditedTime(tEdited);
+        setPlaying(false);
+        return;
+      }
+      syncPlayheadUi(tEdited);
+      const src = editedToSource(segments, tEdited);
+      if (v.readyState >= 1 && Math.abs(v.currentTime - src) > 0.08) {
+        try {
+          v.currentTime = src;
+        } catch {
+          /* ignore */
+        }
+      }
+      playRafRef.current = requestAnimationFrame(tick);
+    };
+
+    syncPlayheadUi(startEdited);
+    playRafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (playRafRef.current) cancelAnimationFrame(playRafRef.current);
+      playRafRef.current = null;
+      v.pause();
+      setEditedTime(editedTimeRef.current);
+    };
+  }, [playing, segments, totalEdited, duration, dict]);
 
   const onLoadedMetadata = () => {
     const v = videoRef.current;
@@ -462,7 +597,10 @@ export default function App() {
       setSnack({ open: true, message: t(dict, 'loadFirst') });
       return;
     }
-    if (!outputDirHandle) await pickOutput();
+    if (!outputDirHandle) {
+      const h = await pickOutput();
+      if (!h) return;
+    }
     setSaveFileName(suggestedMp4Name(inputFile));
     setSaveDialogOpen(true);
   };
@@ -494,6 +632,7 @@ export default function App() {
       ffmpeg.on('progress', onProg);
       const data = await exportSegmentsToMp4(ffmpeg, inputFile, segments, {
         signal,
+        sourceDuration: duration,
         onLog: (m) => setExportLog(m.slice(-160)),
         onProgress: (t) => setEncodeProgress(Math.round(t * 100)),
       });
@@ -531,6 +670,112 @@ export default function App() {
   const cancelExport = async () => {
     exportAbortRef.current?.abort();
     await terminateActiveFfmpeg();
+  };
+
+  const openMergePicker = () => {
+    if (exporting) return;
+    setMergeFileA(null);
+    setMergeFileB(null);
+    setMergePickerOpen(true);
+  };
+
+  const pickMergeFile = (which) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'video/mp4,.mp4';
+    input.onchange = () => {
+      const f = input.files?.[0];
+      if (!f) return;
+      if (!isMp4Extension(f)) {
+        setSnack({ open: true, message: t(dict, 'mp4Only') });
+        return;
+      }
+      if (which === 'a') setMergeFileA(f);
+      else setMergeFileB(f);
+    };
+    input.click();
+  };
+
+  const goMergeSaveStep = async () => {
+    if (!mergeFileA || !mergeFileB) {
+      setSnack({ open: true, message: t(dict, 'mergeNeedsTwo') });
+      return;
+    }
+    setMergePickerOpen(false);
+    setMergeOutFileName(defaultMergeOutName(mergeFileA, mergeFileB));
+    if (!outputDirHandle) {
+      const h = await pickOutput();
+      if (!h) {
+        setMergePickerOpen(true);
+        return;
+      }
+    }
+    setMergeSaveOpen(true);
+  };
+
+  const exportMergedMp4 = async () => {
+    if (!mergeFileA || !mergeFileB || !outputDirHandle) {
+      setSnack({ open: true, message: t(dict, 'pickSaveFolder') });
+      return;
+    }
+    const outName = normalizeOutName(mergeOutFileName, defaultMergeOutName(mergeFileA, mergeFileB));
+    exportAbortRef.current = new AbortController();
+    const signal = exportAbortRef.current.signal;
+
+    setExporting(true);
+    setExportPhase('merge');
+    setEncodeProgress(null);
+    setExportLog('');
+
+    let ffmpeg;
+    const onProg = ({ progress }) => {
+      if (typeof progress === 'number' && Number.isFinite(progress)) {
+        setEncodeProgress(Math.min(100, Math.max(0, Math.round(progress * 100))));
+      }
+    };
+
+    try {
+      const [dimA, dimB] = await Promise.all([probeVideoDimensions(mergeFileA), probeVideoDimensions(mergeFileB)]);
+      const canvas = { width: Math.max(dimA.width, dimB.width), height: Math.max(dimA.height, dimB.height) };
+
+      ffmpeg = await loadFfmpeg({ onLog: (m) => setExportLog(m.slice(-160)) });
+      ffmpeg.on('progress', onProg);
+      const data = await mergeTwoMp4CenterPad(ffmpeg, mergeFileA, mergeFileB, canvas, {
+        signal,
+        onLog: (m) => setExportLog(m.slice(-160)),
+        onProgress: (p) => setEncodeProgress(Math.round(p * 100)),
+      });
+      ffmpeg.off('progress', onProg);
+      setExportPhase('write');
+      setEncodeProgress(100);
+      await writeFileToDirectory(outputDirHandle, outName, data, { signal });
+      setSnack({ open: true, message: `${t(dict, 'mergeSaved')} ${outName}` });
+      setMergeSaveOpen(false);
+      setMergeFileA(null);
+      setMergeFileB(null);
+    } catch (err) {
+      if (ffmpeg) {
+        try {
+          ffmpeg.off('progress', onProg);
+        } catch {
+          /* ignore */
+        }
+      }
+      const aborted = err instanceof DOMException && err.name === 'AbortError';
+      if (aborted) {
+        await terminateActiveFfmpeg();
+        setSnack({ open: true, message: t(dict, 'cancelled') });
+      } else {
+        const msg = err instanceof Error ? err.message : String(err);
+        setSnack({ open: true, message: `${t(dict, 'mergeFailed')} ${msg}` });
+      }
+    } finally {
+      exportAbortRef.current = null;
+      setExporting(false);
+      setExportPhase('idle');
+      setEncodeProgress(null);
+      setExportLog('');
+    }
   };
 
   const openFlagDialog = (which) => {
@@ -606,6 +851,7 @@ export default function App() {
             <Tooltip title={t(dict, 'inclusiveDelete')}><IconButton size="small" color="error" onClick={applyInclusiveDelete} disabled={flagStart == null || flagEnd == null}><DeleteSweepIcon /></IconButton></Tooltip>
             <Tooltip title={t(dict, 'exclusiveDelete')}><IconButton size="small" color="warning" onClick={applyExclusiveDelete} disabled={flagStart == null || flagEnd == null}><DeleteOutsideIcon /></IconButton></Tooltip>
             <Tooltip title={t(dict, 'openSaveDialog')}><IconButton size="small" color="primary" onClick={openSaveDialog} disabled={exporting || !inputFile || !segments.length}><SaveIcon /></IconButton></Tooltip>
+            <Tooltip title={t(dict, 'mergeVideos')}><IconButton size="small" color="secondary" onClick={openMergePicker} disabled={exporting}><MergeVideosIcon /></IconButton></Tooltip>
             <Tooltip title={t(dict, 'language')}><IconButton size="small" onClick={() => setLangDialogOpen(true)}><LanguageIcon /></IconButton></Tooltip>
           </Stack>
 
@@ -617,9 +863,10 @@ export default function App() {
             {exporting ? (
               <>
                 <Stack direction="row" justifyContent="flex-end"><Button size="small" color="inherit" onClick={cancelExport}>{t(dict, 'cancelSave')}</Button></Stack>
-                <LinearProgress variant={exportPhase === 'encode' && encodeProgress != null ? 'determinate' : 'indeterminate'} value={encodeProgress ?? 0} sx={{ height: 8, borderRadius: 1 }} />
+                <LinearProgress variant={(exportPhase === 'encode' || exportPhase === 'merge') && encodeProgress != null ? 'determinate' : 'indeterminate'} value={encodeProgress ?? 0} sx={{ height: 8, borderRadius: 1 }} />
                 <Typography variant="caption" color="text.secondary" sx={{ textAlign: 'right', lineHeight: 1.2, wordBreak: 'break-all' }}>
                   {exportPhase === 'load' && t(dict, 'loadEngine')}
+                  {exportPhase === 'merge' && (encodeProgress != null ? `${t(dict, 'merging')} ${encodeProgress}%` : t(dict, 'merging'))}
                   {exportPhase === 'encode' && (encodeProgress != null ? `${t(dict, 'encoding')} ${encodeProgress}%` : t(dict, 'encoding'))}
                   {exportPhase === 'write' && t(dict, 'writing')}
                   {exportLog ? ` · ${exportLog}` : ''}
@@ -636,7 +883,17 @@ export default function App() {
         <Box sx={{ flex: 1, minWidth: 0, p: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', bgcolor: '#0b0b0b' }}>
           <Paper elevation={4} sx={{ width: '100%', height: '100%', bgcolor: 'black', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}>
             {fileUrl ? (
-              <video ref={videoRef} src={fileUrl} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} controls={false} onLoadedMetadata={onLoadedMetadata} onEnded={() => setPlaying(false)} />
+              <video
+                key={videoSourceKey}
+                ref={videoRef}
+                src={fileUrl}
+                preload="auto"
+                style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }}
+                controls={false}
+                playsInline
+                onLoadedMetadata={onLoadedMetadata}
+                onEnded={() => setPlaying(false)}
+              />
             ) : (
               <Typography color="grey.500">{t(dict, 'chooseVideo')}</Typography>
             )}
@@ -669,10 +926,37 @@ export default function App() {
       <Paper square elevation={3} sx={{ px: 2, py: 1.5, borderTop: 1, borderColor: 'divider' }}>
         <Stack spacing={1}>
           <Stack direction="row" spacing={2}>
-            <Typography variant="caption">{t(dict, 'editedTimeline')} {formatHMS(editedTime)} / {formatHMS(totalEdited)}</Typography>
-            <Typography variant="caption" color="text.secondary">{t(dict, 'sourceTimeline')} {formatHMS(currentSourceTime)} / {formatHMS(duration)}</Typography>
+            <Typography ref={editedTimelineLabelRef} variant="caption">
+              {t(dict, 'editedTimeline')}{' '}
+              {playing ? '' : `${formatHMS(editedTime)} / ${formatHMS(totalEdited)}`}
+            </Typography>
+            <Typography ref={sourceTimelineLabelRef} variant="caption" color="text.secondary">
+              {t(dict, 'sourceTimeline')}{' '}
+              {playing ? '' : `${formatHMS(currentSourceTime)} / ${formatHMS(duration)}`}
+            </Typography>
           </Stack>
-          <Slider size="small" min={0} max={totalEdited > 0 ? totalEdited : 1} step={0.01} value={totalEdited > 0 ? Math.min(editedTime, totalEdited) : 0} onChange={(_, v) => { setEditedTime(Array.isArray(v) ? v[0] : v); setPlaying(false); }} disabled={!fileUrl || totalEdited <= 0} />
+          <Box
+            component="input"
+            ref={sliderInputRef}
+            type="range"
+            min={0}
+            max={totalEdited > 0 ? totalEdited : 1}
+            step={0.01}
+            defaultValue={0}
+            disabled={!fileUrl || totalEdited <= 0}
+            onChange={(e) => {
+              const v = Number(e.target.value);
+              setEditedTime(v);
+              setPlaying(false);
+            }}
+            sx={{
+              width: '100%',
+              height: 28,
+              p: 0,
+              cursor: !fileUrl || totalEdited <= 0 ? 'default' : 'pointer',
+              accentColor: 'primary.main',
+            }}
+          />
           <Box sx={{ position: 'relative', height: 36 }} ref={trackRef}>
             <Box sx={{ position: 'absolute', left: 0, right: 0, top: 10, height: 10, borderRadius: 1, bgcolor: 'action.hover', border: 1, borderColor: 'divider' }} />
             {flagLeftPct(flagStart) != null && <Tooltip title={t(dict, 'flagStart')}><Box onPointerDown={onFlagPointerDown('start')} onPointerMove={onFlagPointerMove('start')} onPointerUp={onFlagPointerUp('start')} onPointerCancel={onFlagPointerUp('start')} sx={{ position: 'absolute', left: `${flagLeftPct(flagStart)}%`, top: 2, transform: 'translateX(-50%)', cursor: 'grab', color: 'success.main', touchAction: 'none' }}><FlagIcon fontSize="small" /></Box></Tooltip>}
@@ -714,7 +998,7 @@ export default function App() {
           <Stack spacing={2} sx={{ mt: 1 }}>
             <Stack direction="row" spacing={1} alignItems="center">
               <TextField label={t(dict, 'savePath')} size="small" value={outputDirLabel || t(dict, 'noFolderChosen')} fullWidth InputProps={{ readOnly: true }} />
-              <IconButton onClick={pickOutput} disabled={exporting}><SaveFolderIcon /></IconButton>
+              <IconButton onClick={() => { void pickOutput(); }} disabled={exporting}><SaveFolderIcon /></IconButton>
             </Stack>
             <TextField label={t(dict, 'saveName')} size="small" value={saveFileName} onChange={(e) => setSaveFileName(e.target.value)} helperText={t(dict, 'saveNameHint')} fullWidth />
           </Stack>
@@ -722,6 +1006,39 @@ export default function App() {
         <DialogActions>
           <Button onClick={() => setSaveDialogOpen(false)} disabled={exporting}>{t(dict, 'cancel')}</Button>
           <Button variant="contained" onClick={exportMp4} disabled={exporting || !outputDirHandle}>{t(dict, 'save')}</Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={mergePickerOpen} onClose={() => !exporting && setMergePickerOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>{t(dict, 'mergePickerTitle')}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <Button variant="outlined" onClick={() => pickMergeFile('a')} disabled={exporting}>{t(dict, 'selectVideoStep1')}</Button>
+            <Typography variant="body2" color="text.secondary">{mergeFileA ? mergeFileA.name : '—'}</Typography>
+            <Button variant="outlined" onClick={() => pickMergeFile('b')} disabled={exporting}>{t(dict, 'selectVideoStep2')}</Button>
+            <Typography variant="body2" color="text.secondary">{mergeFileB ? mergeFileB.name : '—'}</Typography>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setMergePickerOpen(false)} disabled={exporting}>{t(dict, 'cancel')}</Button>
+          <Button variant="contained" onClick={() => { void goMergeSaveStep(); }} disabled={exporting}>{t(dict, 'mergeRun')}</Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={mergeSaveOpen} onClose={() => !exporting && setMergeSaveOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>{t(dict, 'mergeExportTitle')}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <TextField label={t(dict, 'savePath')} size="small" value={outputDirLabel || t(dict, 'noFolderChosen')} fullWidth InputProps={{ readOnly: true }} />
+              <IconButton onClick={() => { void pickOutput(); }} disabled={exporting}><SaveFolderIcon /></IconButton>
+            </Stack>
+            <TextField label={t(dict, 'saveName')} size="small" value={mergeOutFileName} onChange={(e) => setMergeOutFileName(e.target.value)} helperText={t(dict, 'saveNameHint')} fullWidth />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setMergeSaveOpen(false)} disabled={exporting}>{t(dict, 'cancel')}</Button>
+          <Button variant="contained" onClick={() => { void exportMergedMp4(); }} disabled={exporting || !outputDirHandle}>{t(dict, 'save')}</Button>
         </DialogActions>
       </Dialog>
 

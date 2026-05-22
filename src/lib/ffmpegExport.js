@@ -51,6 +51,20 @@ function normalizeSegments(segments) {
 }
 
 /**
+ * Stream copy (-c copy) only cuts on keyframes. Short edits (e.g. ~2s) often fall
+ * inside one GOP, so the removed range still appears in the exported file.
+ */
+export function needsFrameAccurateExport(sorted, sourceDuration = 0) {
+  if (sorted.length > 1) return true;
+  if (sorted.length === 1) {
+    const s = sorted[0];
+    if (s.start > 0.01) return true;
+    if (sourceDuration > 0 && s.end < sourceDuration - 0.01) return true;
+  }
+  return false;
+}
+
+/**
  * @param {import('@ffmpeg/ffmpeg').FFmpeg} ffmpeg
  * @param {string} name
  */
@@ -196,7 +210,7 @@ async function execReencode(ffmpeg, inputName, sorted, outputName, opts = {}) {
     const { complex, maps } = buildFilterComplex(sorted, hasAudio);
     const args = ['-y', '-i', inputName, '-filter_complex', complex, ...maps, ...vargs];
     if (hasAudio) args.push('-c:a', 'aac', '-b:a', '128k');
-    args.push(outputName);
+    args.push('-movflags', '+faststart', outputName);
     onLog?.(hasAudio ? '重編碼（含音訊）…' : '重編碼（僅影像）…');
     await ffmpeg.exec(args, -1, execSig(signal));
   };
@@ -226,6 +240,7 @@ export async function exportSegmentsToMp4(ffmpeg, file, segments, opts = {}) {
   const rawExt = (file.name.split('.').pop() || 'mp4').replace(/[^a-z0-9]/gi, '') || 'mp4';
   const inputName = `src.${rawExt}`;
   const outputName = 'out.mp4';
+  const sourceDuration = Number(opts.sourceDuration) || 0;
 
   await ffmpeg.writeFile(inputName, await fetchFile(file));
 
@@ -237,10 +252,15 @@ export async function exportSegmentsToMp4(ffmpeg, file, segments, opts = {}) {
 
   const wmvLike =
     /\.(wmv|asf)$/i.test(file.name) || /wmv|ms-asf/i.test(file.type || '');
+  const frameAccurate = needsFrameAccurateExport(sorted, sourceDuration);
 
   try {
-    if (wmvLike) {
-      opts.onLog?.('WMV/ASF 無法串流複製成 MP4，直接重編碼匯出…');
+    if (wmvLike || frameAccurate) {
+      if (frameAccurate && !wmvLike) {
+        opts.onLog?.('使用精確裁切匯出（有刪除片段時無法僅串流複製）…');
+      } else {
+        opts.onLog?.('WMV/ASF 無法串流複製成 MP4，直接重編碼匯出…');
+      }
       opts.onProgress?.(0);
       await execReencode(ffmpeg, inputName, sorted, outputName, opts);
     } else {

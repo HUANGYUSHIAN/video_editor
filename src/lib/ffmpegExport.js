@@ -1,4 +1,12 @@
 import { fetchFile } from '@ffmpeg/util';
+import {
+  canPreserveSubtitleTracks,
+  computeScaledDimensions,
+  needsScaleExport,
+  parseExportMaxEdge,
+  scaleFilterForMaxEdge,
+  scaledDimensionsLabel,
+} from './resolution.js';
 import { volumeGainFromPercent } from './volume.js';
 import { editedDuration } from '../utils/segments.js';
 
@@ -6,18 +14,25 @@ import { editedDuration } from '../utils/segments.js';
  * @param {{ start: number; end: number }[]} segments
  * @param {boolean} hasAudio
  * @param {number} [volumeGain] linear multiplier (e.g. 2 for 200%)
+ * @param {string | null} [scaleFilter] ffmpeg scale filter (long-edge downscale)
  */
-export function buildFilterComplex(segments, hasAudio, volumeGain = 1) {
+export function buildFilterComplex(segments, hasAudio, volumeGain = 1, scaleFilter = null) {
   const n = segments.length;
   if (n === 0) throw new Error('沒有可輸出的片段');
 
   const vol =
     volumeGain === 1 ? '' : `,volume=${volumeGain === 0 ? '0' : volumeGain}`;
+  const scale = scaleFilter || null;
 
   const vf = [];
   for (let i = 0; i < n; i++) {
     const { start, end } = segments[i];
-    vf.push(`[0:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS[v${i}]`);
+    if (scale && n === 1) {
+      vf.push(`[0:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS[v0t]`);
+      vf.push(`[v0t]${scale}[v0]`);
+    } else {
+      vf.push(`[0:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS[v${i}]`);
+    }
     if (hasAudio) {
       vf.push(`[0:a]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS${vol}[a${i}]`);
     }
@@ -35,8 +50,18 @@ export function buildFilterComplex(segments, hasAudio, volumeGain = 1) {
     concatIn += hasAudio ? `[v${i}][a${i}]` : `[v${i}]`;
   }
   if (hasAudio) {
+    if (scale) {
+      vf.push(`${concatIn}concat=n=${n}:v=1:a=1[outvt][outa]`);
+      vf.push(`[outvt]${scale}[outv]`);
+      return { complex: vf.join(';'), maps: ['-map', '[outv]', '-map', '[outa]'] };
+    }
     vf.push(`${concatIn}concat=n=${n}:v=1:a=1[outv][outa]`);
     return { complex: vf.join(';'), maps: ['-map', '[outv]', '-map', '[outa]'] };
+  }
+  if (scale) {
+    vf.push(`${concatIn}concat=n=${n}:v=1:a=0[outvt]`);
+    vf.push(`[outvt]${scale}[outv]`);
+    return { complex: vf.join(';'), maps: ['-map', '[outv]'] };
   }
   vf.push(`${concatIn}concat=n=${n}:v=1:a=0[outv]`);
   return { complex: vf.join(';'), maps: ['-map', '[outv]'] };
@@ -83,7 +108,6 @@ function execSig(s) {
 }
 
 /**
- * 從 ffmpeg 統計行推算輸出時間進度（僅重編碼時較常出現）。
  * @param {string} message
  * @param {number} totalOutSec
  */
@@ -95,24 +119,37 @@ function parseTimeProgress(message, totalOutSec) {
 }
 
 /**
- * 串流複製：不重新編碼，只裁切與接回（同為 MP4 時通常極快）。
- * 起點可能落在最近關鍵幀（與專業「無重編碼裁切」行為一致）。
- *
+ * @param {boolean} preserveSubs
+ */
+function streamCopyMaps(preserveSubs) {
+  if (preserveSubs) {
+    return ['-map', '0:v', '-map', '0:a?', '-map', '0:s?', '-c', 'copy', '-c:s', 'copy'];
+  }
+  return ['-c', 'copy'];
+}
+
+/**
  * @param {import('@ffmpeg/ffmpeg').FFmpeg} ffmpeg
  * @param {string} inputName
  * @param {{ start: number; end: number }[]} sorted
  * @param {string} outputName
- * @param {{ onProgress?: (p: number) => void; onLog?: (s: string) => void; signal?: AbortSignal }} [opts]
+ * @param {{ onProgress?: (p: number) => void; onLog?: (s: string) => void; signal?: AbortSignal; sourceDuration?: number }} [opts]
  */
 async function exportWithStreamCopy(ffmpeg, inputName, sorted, outputName, opts = {}) {
   const { onProgress, onLog, signal } = opts;
   const n = sorted.length;
+  const preserveSubs = canPreserveSubtitleTracks(sorted, opts.sourceDuration ?? 0);
+  const copyTail = streamCopyMaps(preserveSubs);
 
   if (n === 1) {
     const { start, end } = sorted[0];
     const dur = end - start;
     onProgress?.(0.05);
-    onLog?.('使用串流複製（無重編碼）…');
+    onLog?.(
+      preserveSubs
+        ? '使用串流複製（無重編碼，保留字幕軌）…'
+        : '使用串流複製（無重編碼）…',
+    );
     await ffmpeg.exec(
       [
         '-y',
@@ -122,8 +159,7 @@ async function exportWithStreamCopy(ffmpeg, inputName, sorted, outputName, opts 
         inputName,
         '-t',
         String(dur),
-        '-c',
-        'copy',
+        ...copyTail,
         '-avoid_negative_ts',
         'make_zero',
         outputName,
@@ -166,7 +202,7 @@ async function exportWithStreamCopy(ffmpeg, inputName, sorted, outputName, opts 
   const listBody = parts.map((p) => `file '${p}'`).join('\n');
   await ffmpeg.writeFile('concat.txt', new TextEncoder().encode(listBody));
   onProgress?.(0.88);
-  onLog?.('串接片段（無重編碼）…');
+  onLog?.('串接片段（無重編碼；多段匯出不含字幕軌）…');
   await ffmpeg.exec(
     [
       '-y',
@@ -196,13 +232,17 @@ async function exportWithStreamCopy(ffmpeg, inputName, sorted, outputName, opts 
  * @param {string} inputName
  * @param {{ start: number; end: number }[]} sorted
  * @param {string} outputName
- * @param {{ onProgress?: (p: number) => void; onLog?: (s: string) => void; signal?: AbortSignal }} [opts]
+ * @param {{ onProgress?: (p: number) => void; onLog?: (s: string) => void; signal?: AbortSignal; sourceDuration?: number; volumePercent?: number; volumeGain?: number; scaleFilter?: string | null; outputMaxEdge?: number | null; sourceVideoWidth?: number; sourceVideoHeight?: number }} [opts]
  */
 async function execReencode(ffmpeg, inputName, sorted, outputName, opts = {}) {
   const { onProgress, onLog, signal } = opts;
   const totalOutSec = editedDuration(sorted);
   const volumeGain =
     typeof opts.volumeGain === 'number' ? opts.volumeGain : volumeGainFromPercent(opts.volumePercent ?? 100);
+  const scaleFilter = opts.scaleFilter ?? null;
+  const outputMaxEdge = opts.outputMaxEdge ?? null;
+  const preserveSubs =
+    canPreserveSubtitleTracks(sorted, opts.sourceDuration ?? 0) && !scaleFilter;
 
   const logHandler = ({ message }) => {
     onLog?.(message);
@@ -214,11 +254,33 @@ async function execReencode(ffmpeg, inputName, sorted, outputName, opts = {}) {
   const videoArgsH264 = ['-c:v', 'libx264', '-crf', '28', '-preset', 'ultrafast'];
 
   const run = async (hasAudio, vargs) => {
-    const { complex, maps } = buildFilterComplex(sorted, hasAudio, volumeGain);
-    const args = ['-y', '-i', inputName, '-filter_complex', complex, ...maps, ...vargs];
+    const { complex, maps } = buildFilterComplex(sorted, hasAudio, volumeGain, scaleFilter);
+    const args = ['-y', '-i', inputName, '-filter_complex', complex, ...maps];
+    if (preserveSubs) {
+      args.push('-map', '0:s?', '-c:s', 'copy');
+    }
+    args.push(...vargs);
     if (hasAudio) args.push('-c:a', 'aac', '-b:a', '128k');
     args.push('-movflags', '+faststart', outputName);
-    onLog?.(hasAudio ? '重編碼（含音訊）…' : '重編碼（僅影像）…');
+    if (outputMaxEdge && scaleFilter) {
+      const label = scaledDimensionsLabel(
+        outputMaxEdge,
+        opts.sourceVideoWidth ?? 0,
+        opts.sourceVideoHeight ?? 0,
+      );
+      onLog?.(`重編碼（長邊 ${outputMaxEdge}px → ${label || '縮放'}）…`);
+    } else if (preserveSubs) {
+      onLog?.('重編碼（含音訊，保留字幕軌）…');
+    } else if (hasAudio) {
+      onLog?.('重編碼（含音訊）…');
+    } else {
+      onLog?.('重編碼（僅影像）…');
+    }
+    if (!preserveSubs && sorted.length > 1) {
+      onLog?.('已裁切多段：內嵌字幕軌無法對齊，已略過字幕。');
+    } else if (!preserveSubs && scaleFilter) {
+      onLog?.('縮放輸出：內嵌字幕軌未保留（軟字幕請用燒錄或外部字幕）。');
+    }
     await ffmpeg.exec(args, -1, execSig(signal));
   };
 
@@ -240,7 +302,7 @@ async function execReencode(ffmpeg, inputName, sorted, outputName, opts = {}) {
  * @param {import('@ffmpeg/ffmpeg').FFmpeg} ffmpeg
  * @param {File} file
  * @param {{ start: number; end: number }[]} segments
- * @param {{ onProgress?: (p: number) => void; onLog?: (s: string) => void; signal?: AbortSignal }} [opts]
+ * @param {{ onProgress?: (p: number) => void; onLog?: (s: string) => void; signal?: AbortSignal; sourceDuration?: number; sourceVideoWidth?: number; sourceVideoHeight?: number; exportResolution?: string; volumePercent?: number }} [opts]
  * @returns {Promise<Uint8Array>}
  */
 export async function exportSegmentsToMp4(ffmpeg, file, segments, opts = {}) {
@@ -248,6 +310,17 @@ export async function exportSegmentsToMp4(ffmpeg, file, segments, opts = {}) {
   const inputName = `src.${rawExt}`;
   const outputName = 'out.mp4';
   const sourceDuration = Number(opts.sourceDuration) || 0;
+  const sourceVideoWidth = Number(opts.sourceVideoWidth) || 0;
+  const sourceVideoHeight = Number(opts.sourceVideoHeight) || 0;
+  const outputMaxEdge = parseExportMaxEdge(
+    opts.exportResolution,
+    sourceVideoWidth,
+    sourceVideoHeight,
+  );
+  const scaleFilter =
+    outputMaxEdge != null
+      ? scaleFilterForMaxEdge(outputMaxEdge, sourceVideoWidth, sourceVideoHeight)
+      : null;
 
   await ffmpeg.writeFile(inputName, await fetchFile(file));
 
@@ -262,10 +335,33 @@ export async function exportSegmentsToMp4(ffmpeg, file, segments, opts = {}) {
   const frameAccurate = needsFrameAccurateExport(sorted, sourceDuration);
   const volumeGain = volumeGainFromPercent(opts.volumePercent ?? 100);
   const needsVolume = volumeGain !== 1;
+  const needsScale = needsScaleExport(
+    opts.exportResolution,
+    sourceVideoWidth,
+    sourceVideoHeight,
+  );
+
+  const reencodeOpts = {
+    ...opts,
+    volumeGain,
+    scaleFilter,
+    outputMaxEdge,
+    sourceDuration,
+    sourceVideoWidth,
+    sourceVideoHeight,
+  };
 
   try {
-    if (wmvLike || frameAccurate || needsVolume) {
-      if (needsVolume && !wmvLike && !frameAccurate) {
+    if (wmvLike || frameAccurate || needsVolume || needsScale) {
+      if (needsScale && !wmvLike && !frameAccurate && !needsVolume) {
+        const dims = computeScaledDimensions(
+          sourceVideoWidth,
+          sourceVideoHeight,
+          outputMaxEdge,
+        );
+        const sizeText = dims ? `${dims.width}×${dims.height}` : '縮放';
+        opts.onLog?.(`長邊縮至 ${outputMaxEdge}px（${sizeText}）並匯出…`);
+      } else if (needsVolume && !wmvLike && !frameAccurate) {
         opts.onLog?.('套用音量調整，使用重編碼匯出…');
       } else if (frameAccurate && !wmvLike) {
         opts.onLog?.('使用精確裁切匯出（有刪除片段時無法僅串流複製）…');
@@ -273,13 +369,14 @@ export async function exportSegmentsToMp4(ffmpeg, file, segments, opts = {}) {
         opts.onLog?.('WMV/ASF 無法串流複製成 MP4，直接重編碼匯出…');
       }
       opts.onProgress?.(0);
-      await execReencode(ffmpeg, inputName, sorted, outputName, { ...opts, volumeGain });
+      await execReencode(ffmpeg, inputName, sorted, outputName, reencodeOpts);
     } else {
       try {
         await exportWithStreamCopy(ffmpeg, inputName, sorted, outputName, {
           onProgress: opts.onProgress,
           onLog: opts.onLog,
           signal: opts.signal,
+          sourceDuration,
         });
       } catch (e) {
         for (let i = 0; i < 32; i++) await safeDelete(ffmpeg, `part${i}.mp4`);
@@ -288,7 +385,7 @@ export async function exportSegmentsToMp4(ffmpeg, file, segments, opts = {}) {
         const msg = e instanceof Error ? e.message : String(e);
         opts.onLog?.(`串流複製失敗，改為重編碼（WebAssembly 會很慢）：${msg}`);
         opts.onProgress?.(0);
-        await execReencode(ffmpeg, inputName, sorted, outputName, { ...opts, volumeGain });
+        await execReencode(ffmpeg, inputName, sorted, outputName, reencodeOpts);
       }
     }
 

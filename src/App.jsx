@@ -7,7 +7,11 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
+  FormControl,
   IconButton,
+  InputLabel,
+  MenuItem,
+  Select,
   LinearProgress,
   List,
   ListItemButton,
@@ -39,6 +43,7 @@ import { isMp4Extension, suggestedMp4Name, supportsDirectoryPicker, writeFileToD
 import { exportSegmentsToMp4 } from './lib/ffmpegExport.js';
 import { mergeManyMp4CenterPad } from './lib/ffmpegMerge.js';
 import { loadFfmpeg, terminateActiveFfmpeg } from './lib/loadFfmpeg.js';
+import { getAllowedExportMaxEdges, scaledDimensionsLabel } from './lib/resolution.js';
 import { normalizeVolumePercent, volumeGainFromPercent } from './lib/volume.js';
 import {
   clampSourceToKept,
@@ -99,6 +104,13 @@ const I18N = {
     noFolderChosen: 'No folder selected',
     saveName: 'Save Name',
     saveNameHint: 'Default is source filename; .mp4 is auto-appended',
+    exportResolution: 'Output resolution',
+    exportResolutionOriginal: 'Original',
+    exportResolutionHint:
+      'Downscale only. Each number is the longest side (e.g. 1920×1080 → 1080 gives 1080×608). Same as source: pick Original. Soft subtitles: full unedited export only.',
+    exportResolutionNoDownscale: 'Longest side is under 360px — only original resolution is available.',
+    exportResolutionSameAsSource:
+      'Selected size matches the source long edge; use Original for full resolution or pick a lower value.',
     save: 'Save',
     language: 'Language',
     languageTitle: 'Choose Language',
@@ -170,6 +182,13 @@ const I18N = {
     noFolderChosen: '尚未選擇資料夾',
     saveName: '存檔名稱',
     saveNameHint: '預設為原檔名，若未填 .mp4 會自動補上',
+    exportResolution: '輸出解析度',
+    exportResolutionOriginal: '原始',
+    exportResolutionHint:
+      '僅能縮小。數字代表長邊像素（例：1920×1080 選 1080 → 約 1080×608）。與來源相同請選「原始」。軟字幕僅未裁切且未縮放時保留。',
+    exportResolutionNoDownscale: '來源長邊低於 360，僅能輸出原始解析度。',
+    exportResolutionSameAsSource:
+      '所選長邊與來源相同，請選「原始」維持全解析度，或改選較小數值。',
     save: '存檔',
     language: '語言',
     languageTitle: '選擇語言',
@@ -241,6 +260,13 @@ const I18N = {
     noFolderChosen: 'フォルダ未選択',
     saveName: '保存ファイル名',
     saveNameHint: '元ファイル名が既定。 .mp4 は自動付与',
+    exportResolution: '出力解像度',
+    exportResolutionOriginal: 'オリジナル',
+    exportResolutionHint:
+      '縮小のみ。数値は長辺のピクセル（例：1920×1080 で 1080 → 約 1080×608）。ソースと同じ場合は「オリジナル」。',
+    exportResolutionNoDownscale: 'ソースの長辺が 360 未満のため、オリジナルのみ選択可能。',
+    exportResolutionSameAsSource:
+      '選択した長辺はソースと同じです。フル解像度は「オリジナル」、縮小はより小さい数値を選んでください。',
     save: '保存',
     language: 'Language',
     languageTitle: '言語を選択',
@@ -369,6 +395,9 @@ export default function App() {
   const [outputDirLabel, setOutputDirLabel] = useState('');
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
   const [saveFileName, setSaveFileName] = useState('');
+  const [sourceVideoHeight, setSourceVideoHeight] = useState(0);
+  const [sourceVideoWidth, setSourceVideoWidth] = useState(0);
+  const [exportResolution, setExportResolution] = useState('original');
 
   const [exporting, setExporting] = useState(false);
   const [exportPhase, setExportPhase] = useState('idle');
@@ -409,6 +438,11 @@ export default function App() {
   const sourceTimelineLabelRef = useRef(null);
 
   const totalEdited = useMemo(() => editedDuration(segments), [segments]);
+
+  const allowedExportMaxEdges = useMemo(
+    () => getAllowedExportMaxEdges(sourceVideoWidth, sourceVideoHeight),
+    [sourceVideoWidth, sourceVideoHeight],
+  );
 
   useEffect(() => {
     editedTimeRef.current = editedTime;
@@ -680,6 +714,14 @@ export default function App() {
     setHistoryDialog(null);
   };
 
+  const readSourceDimensions = useCallback(() => {
+    const v = videoRef.current;
+    if (v?.videoWidth > 0 && v.videoHeight > 0) {
+      return { width: v.videoWidth, height: v.videoHeight };
+    }
+    return { width: sourceVideoWidth, height: sourceVideoHeight };
+  }, [sourceVideoWidth, sourceVideoHeight]);
+
   const openSaveDialog = async () => {
     if (!inputFile || !segments.length) {
       setSnack({ open: true, message: t(dict, 'loadFirst') });
@@ -690,6 +732,16 @@ export default function App() {
       if (!h) return;
     }
     setSaveFileName(suggestedMp4Name(inputFile));
+    setExportResolution('original');
+    try {
+      const dims = await probeVideoDimensions(inputFile);
+      setSourceVideoHeight(dims.height);
+      setSourceVideoWidth(dims.width);
+    } catch {
+      const live = readSourceDimensions();
+      setSourceVideoHeight(live.height);
+      setSourceVideoWidth(live.width);
+    }
     setSaveDialogOpen(true);
   };
 
@@ -698,6 +750,30 @@ export default function App() {
       setSnack({ open: true, message: t(dict, 'pickSaveFolder') });
       return;
     }
+
+    const live = readSourceDimensions();
+    let srcH = live.height;
+    let srcW = live.width;
+    if (srcH <= 0) {
+      try {
+        const dims = await probeVideoDimensions(inputFile);
+        srcH = dims.height;
+        srcW = dims.width;
+      } catch {
+        /* keep 0 */
+      }
+    }
+
+    let resolutionForExport = exportResolution;
+    if (resolutionForExport !== 'original') {
+      const pickEdge = Math.round(Number(resolutionForExport));
+      const srcMax = Math.max(srcW, srcH);
+      if (srcMax > 0 && pickEdge >= srcMax) {
+        setSnack({ open: true, message: t(dict, 'exportResolutionSameAsSource') });
+        resolutionForExport = 'original';
+      }
+    }
+
     const outName = normalizeOutName(saveFileName, suggestedMp4Name(inputFile));
     exportAbortRef.current = new AbortController();
     const signal = exportAbortRef.current.signal;
@@ -721,6 +797,9 @@ export default function App() {
       const data = await exportSegmentsToMp4(ffmpeg, inputFile, segments, {
         signal,
         sourceDuration: duration,
+        sourceVideoHeight: srcH,
+        sourceVideoWidth: srcW,
+        exportResolution: resolutionForExport,
         volumePercent,
         onLog: (m) => setExportLog(m.slice(-160)),
         onProgress: (t) => setEncodeProgress(Math.round(t * 100)),
@@ -1123,6 +1202,31 @@ export default function App() {
               <IconButton onClick={() => { void pickOutput(); }} disabled={exporting}><SaveFolderIcon /></IconButton>
             </Stack>
             <TextField label={t(dict, 'saveName')} size="small" value={saveFileName} onChange={(e) => setSaveFileName(e.target.value)} helperText={t(dict, 'saveNameHint')} fullWidth />
+            <FormControl fullWidth size="small" disabled={exporting}>
+              <InputLabel id="export-resolution-label">{t(dict, 'exportResolution')}</InputLabel>
+              <Select
+                labelId="export-resolution-label"
+                label={t(dict, 'exportResolution')}
+                value={exportResolution}
+                onChange={(e) => setExportResolution(e.target.value)}
+              >
+                <MenuItem value="original">
+                  {sourceVideoHeight > 0
+                    ? `${t(dict, 'exportResolutionOriginal')} (${sourceVideoWidth}×${sourceVideoHeight})`
+                    : t(dict, 'exportResolutionOriginal')}
+                </MenuItem>
+                {allowedExportMaxEdges.map((edge) => (
+                  <MenuItem key={edge} value={String(edge)}>
+                    {edge} ({scaledDimensionsLabel(edge, sourceVideoWidth, sourceVideoHeight)})
+                  </MenuItem>
+                ))}
+              </Select>
+              <Typography variant="caption" color="text.secondary" sx={{ mt: 0.75, display: 'block' }}>
+                {allowedExportMaxEdges.length === 0
+                  ? t(dict, 'exportResolutionNoDownscale')
+                  : t(dict, 'exportResolutionHint')}
+              </Typography>
+            </FormControl>
           </Stack>
         </DialogContent>
         <DialogActions>

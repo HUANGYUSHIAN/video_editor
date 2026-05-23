@@ -14,42 +14,66 @@ function execSig(s) {
 }
 
 /**
- * Concatenate two MP4s: full file 1 then full file 2. Canvas = max(w1,w2) x max(h1,h2);
- * each video is only padded (centered), not scaled.
+ * Concatenate MP4s in order. Canvas = max(w) x max(h); each clip is pad-centered, not scaled.
  *
  * @param {import('@ffmpeg/ffmpeg').FFmpeg} ffmpeg
- * @param {File} fileA
- * @param {File} fileB
+ * @param {File[]} files at least 2
  * @param {{ width: number; height: number }} canvas
  * @param {{ onProgress?: (p: number) => void; onLog?: (s: string) => void; signal?: AbortSignal }} [opts]
  * @returns {Promise<Uint8Array>}
  */
-export async function mergeTwoMp4CenterPad(ffmpeg, fileA, fileB, canvas, opts = {}) {
+export async function mergeManyMp4CenterPad(ffmpeg, files, canvas, opts = {}) {
   const { onProgress, onLog, signal } = opts;
+  const n = files.length;
+  if (n < 2) throw new Error('At least 2 videos are required to merge');
+
   const W = Math.max(1, Math.round(canvas.width));
   const H = Math.max(1, Math.round(canvas.height));
-  const in0 = 'merge_in0.mp4';
-  const in1 = 'merge_in1.mp4';
-  const outName = 'merge_out.mp4';
-
-  await ffmpeg.writeFile(in0, await fetchFile(fileA));
-  await ffmpeg.writeFile(in1, await fetchFile(fileB));
-  onProgress?.(0.05);
-
   const pad = `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p,setsar=1`;
+  const outName = 'merge_out.mp4';
+  const inNames = [];
+
+  for (let i = 0; i < n; i++) {
+    const name = `merge_in${i}.mp4`;
+    onLog?.(`Loading clip ${i + 1}/${n}…`);
+    onProgress?.(0.02 + (i / n) * 0.28);
+    await ffmpeg.writeFile(name, await fetchFile(files[i]));
+    inNames.push(name);
+  }
+
+  const buildFc = (withAudio) => {
+    const vf = [];
+    for (let i = 0; i < n; i++) {
+      vf.push(`[${i}:v]${pad}[v${i}]`);
+      if (withAudio) {
+        vf.push(
+          `[${i}:a]aformat=sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS[a${i}]`,
+        );
+      }
+    }
+    let concatIn = '';
+    for (let i = 0; i < n; i++) {
+      concatIn += withAudio ? `[v${i}][a${i}]` : `[v${i}]`;
+    }
+    if (withAudio) {
+      vf.push(`${concatIn}concat=n=${n}:v=1:a=1[outv][outa]`);
+    } else {
+      vf.push(`${concatIn}concat=n=${n}:v=1:a=0[outv]`);
+    }
+    return vf.join(';');
+  };
+
+  const inputArgs = files.flatMap((_, i) => ['-i', `merge_in${i}.mp4`]);
 
   const runWithAudio = async () => {
-    const fc = `[0:v]${pad}[v0];[1:v]${pad}[v1];[0:a]aformat=sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS[a0];[1:a]aformat=sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS[a1];[v0][a0][v1][a1]concat=n=2:v=1:a=1[outv][outa]`;
-    onLog?.('Merging with audio…');
+    onLog?.(`Merging ${n} clips with audio…`);
+    onProgress?.(0.35);
     await ffmpeg.exec(
       [
         '-y',
-        '-i',
-        in0,
-        '-i',
-        in1,
+        ...inputArgs,
         '-filter_complex',
-        fc,
+        buildFc(true),
         '-map',
         '[outv]',
         '-map',
@@ -75,17 +99,14 @@ export async function mergeTwoMp4CenterPad(ffmpeg, fileA, fileB, canvas, opts = 
 
   const runVideoOnly = async () => {
     await safeDelete(ffmpeg, outName);
-    const fc = `[0:v]${pad}[v0];[1:v]${pad}[v1];[v0][v1]concat=n=2:v=1:a=0[outv]`;
-    onLog?.('Merging video only (no usable audio on one or both inputs)…');
+    onLog?.('Merging video only (no usable audio on one or more inputs)…');
+    onProgress?.(0.4);
     await ffmpeg.exec(
       [
         '-y',
-        '-i',
-        in0,
-        '-i',
-        in1,
+        ...inputArgs,
         '-filter_complex',
-        fc,
+        buildFc(false),
         '-map',
         '[outv]',
         '-an',
@@ -109,7 +130,6 @@ export async function mergeTwoMp4CenterPad(ffmpeg, fileA, fileB, canvas, opts = 
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     onLog?.(`Audio merge failed, retrying video-only: ${msg}`);
-    onProgress?.(0.35);
     await runVideoOnly();
   }
 
@@ -117,10 +137,14 @@ export async function mergeTwoMp4CenterPad(ffmpeg, fileA, fileB, canvas, opts = 
   const out = await ffmpeg.readFile(outName);
   const buf = out instanceof Uint8Array ? out : new Uint8Array(out);
 
-  await safeDelete(ffmpeg, in0);
-  await safeDelete(ffmpeg, in1);
+  for (const name of inNames) await safeDelete(ffmpeg, name);
   await safeDelete(ffmpeg, outName);
 
   onProgress?.(1);
   return buf;
+}
+
+/** @deprecated Use mergeManyMp4CenterPad */
+export async function mergeTwoMp4CenterPad(ffmpeg, fileA, fileB, canvas, opts = {}) {
+  return mergeManyMp4CenterPad(ffmpeg, [fileA, fileB], canvas, opts);
 }

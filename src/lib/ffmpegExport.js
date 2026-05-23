@@ -1,20 +1,25 @@
 import { fetchFile } from '@ffmpeg/util';
+import { volumeGainFromPercent } from './volume.js';
 import { editedDuration } from '../utils/segments.js';
 
 /**
  * @param {{ start: number; end: number }[]} segments
  * @param {boolean} hasAudio
+ * @param {number} [volumeGain] linear multiplier (e.g. 2 for 200%)
  */
-export function buildFilterComplex(segments, hasAudio) {
+export function buildFilterComplex(segments, hasAudio, volumeGain = 1) {
   const n = segments.length;
   if (n === 0) throw new Error('沒有可輸出的片段');
+
+  const vol =
+    volumeGain === 1 ? '' : `,volume=${volumeGain === 0 ? '0' : volumeGain}`;
 
   const vf = [];
   for (let i = 0; i < n; i++) {
     const { start, end } = segments[i];
     vf.push(`[0:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS[v${i}]`);
     if (hasAudio) {
-      vf.push(`[0:a]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS[a${i}]`);
+      vf.push(`[0:a]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS${vol}[a${i}]`);
     }
   }
 
@@ -196,6 +201,8 @@ async function exportWithStreamCopy(ffmpeg, inputName, sorted, outputName, opts 
 async function execReencode(ffmpeg, inputName, sorted, outputName, opts = {}) {
   const { onProgress, onLog, signal } = opts;
   const totalOutSec = editedDuration(sorted);
+  const volumeGain =
+    typeof opts.volumeGain === 'number' ? opts.volumeGain : volumeGainFromPercent(opts.volumePercent ?? 100);
 
   const logHandler = ({ message }) => {
     onLog?.(message);
@@ -207,7 +214,7 @@ async function execReencode(ffmpeg, inputName, sorted, outputName, opts = {}) {
   const videoArgsH264 = ['-c:v', 'libx264', '-crf', '28', '-preset', 'ultrafast'];
 
   const run = async (hasAudio, vargs) => {
-    const { complex, maps } = buildFilterComplex(sorted, hasAudio);
+    const { complex, maps } = buildFilterComplex(sorted, hasAudio, volumeGain);
     const args = ['-y', '-i', inputName, '-filter_complex', complex, ...maps, ...vargs];
     if (hasAudio) args.push('-c:a', 'aac', '-b:a', '128k');
     args.push('-movflags', '+faststart', outputName);
@@ -253,16 +260,20 @@ export async function exportSegmentsToMp4(ffmpeg, file, segments, opts = {}) {
   const wmvLike =
     /\.(wmv|asf)$/i.test(file.name) || /wmv|ms-asf/i.test(file.type || '');
   const frameAccurate = needsFrameAccurateExport(sorted, sourceDuration);
+  const volumeGain = volumeGainFromPercent(opts.volumePercent ?? 100);
+  const needsVolume = volumeGain !== 1;
 
   try {
-    if (wmvLike || frameAccurate) {
-      if (frameAccurate && !wmvLike) {
+    if (wmvLike || frameAccurate || needsVolume) {
+      if (needsVolume && !wmvLike && !frameAccurate) {
+        opts.onLog?.('套用音量調整，使用重編碼匯出…');
+      } else if (frameAccurate && !wmvLike) {
         opts.onLog?.('使用精確裁切匯出（有刪除片段時無法僅串流複製）…');
       } else {
         opts.onLog?.('WMV/ASF 無法串流複製成 MP4，直接重編碼匯出…');
       }
       opts.onProgress?.(0);
-      await execReencode(ffmpeg, inputName, sorted, outputName, opts);
+      await execReencode(ffmpeg, inputName, sorted, outputName, { ...opts, volumeGain });
     } else {
       try {
         await exportWithStreamCopy(ffmpeg, inputName, sorted, outputName, {
@@ -277,7 +288,7 @@ export async function exportSegmentsToMp4(ffmpeg, file, segments, opts = {}) {
         const msg = e instanceof Error ? e.message : String(e);
         opts.onLog?.(`串流複製失敗，改為重編碼（WebAssembly 會很慢）：${msg}`);
         opts.onProgress?.(0);
-        await execReencode(ffmpeg, inputName, sorted, outputName, opts);
+        await execReencode(ffmpeg, inputName, sorted, outputName, { ...opts, volumeGain });
       }
     }
 

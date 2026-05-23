@@ -13,6 +13,7 @@ import {
   ListItemButton,
   ListItemText,
   Paper,
+  Slider,
   Snackbar,
   Stack,
   TextField,
@@ -26,7 +27,9 @@ import {
   FlagIcon,
   FolderOpenIcon,
   LanguageIcon,
+  AddIcon,
   MergeVideosIcon,
+  VolumeIcon,
   PauseIcon,
   PlayArrowIcon,
   SaveFolderIcon,
@@ -34,8 +37,9 @@ import {
 } from './icons.jsx';
 import { isMp4Extension, suggestedMp4Name, supportsDirectoryPicker, writeFileToDirectory } from './lib/browserFs.js';
 import { exportSegmentsToMp4 } from './lib/ffmpegExport.js';
-import { mergeTwoMp4CenterPad } from './lib/ffmpegMerge.js';
+import { mergeManyMp4CenterPad } from './lib/ffmpegMerge.js';
 import { loadFfmpeg, terminateActiveFfmpeg } from './lib/loadFfmpeg.js';
+import { normalizeVolumePercent, volumeGainFromPercent } from './lib/volume.js';
 import {
   clampSourceToKept,
   editedDuration,
@@ -102,12 +106,19 @@ const I18N = {
     mergePickerTitle: 'Merge videos',
     selectVideoStep1: 'Select first video',
     selectVideoStep2: 'Select second video',
+    selectVideoN: 'Select video',
+    mergeAddVideo: 'Add video',
     mergeRun: 'Merge',
-    mergeNeedsTwo: 'Please select both MP4 files.',
+    mergeNeedsTwo: 'Please select at least 2 MP4 files.',
+    mergeNeedsAll: 'Please select a file for every slot.',
     mergeExportTitle: 'Save merged file',
     mergeSaved: 'Merged file saved:',
     merging: 'Merging videos',
     mergeFailed: 'Merge failed:',
+    volume: 'Volume',
+    volumeTitle: 'Volume (0–200%)',
+    volumeHint: 'Output = original × (value ÷ 100). 200 = 2×, 50 = half, 0 = mute.',
+    volumeApply: 'Apply',
   },
   zh: {
     appInfo: '僅支援 MP4 編輯，含 inclusive / exclusive 刪除。',
@@ -166,12 +177,19 @@ const I18N = {
     mergePickerTitle: '合併影片',
     selectVideoStep1: '選擇第一部影片',
     selectVideoStep2: '選擇第二部影片',
+    selectVideoN: '選擇影片',
+    mergeAddVideo: '新增影片',
     mergeRun: '合併',
-    mergeNeedsTwo: '請選擇兩個 MP4 檔案。',
+    mergeNeedsTwo: '請至少選擇 2 個 MP4 檔案。',
+    mergeNeedsAll: '請為每一個欄位都選擇檔案。',
     mergeExportTitle: '儲存合併結果',
     mergeSaved: '合併檔已儲存：',
     merging: '合併影片中',
     mergeFailed: '合併失敗：',
+    volume: '音量',
+    volumeTitle: '音量（0–200%）',
+    volumeHint: '輸出音量 = 原始 ×（數值 ÷ 100）。200 = 2 倍，50 = 一半，0 = 靜音。',
+    volumeApply: '套用',
   },
   ja: {
     appInfo: 'MP4専用エディタ（inclusive / exclusive 削除対応）。',
@@ -230,12 +248,19 @@ const I18N = {
     mergePickerTitle: '動画を結合',
     selectVideoStep1: '1本目の動画を選択',
     selectVideoStep2: '2本目の動画を選択',
+    selectVideoN: '動画を選択',
+    mergeAddVideo: '動画を追加',
     mergeRun: '結合',
-    mergeNeedsTwo: '両方の MP4 を選択してください。',
+    mergeNeedsTwo: '少なくとも 2 つの MP4 を選択してください。',
+    mergeNeedsAll: 'すべての欄にファイルを選択してください。',
     mergeExportTitle: '結合ファイルの保存',
     mergeSaved: '結合ファイルを保存しました：',
     merging: '動画を結合中',
     mergeFailed: '結合失敗：',
+    volume: '音量',
+    volumeTitle: '音量（0–200%）',
+    volumeHint: '出力 = 元の音量 ×（値 ÷ 100）。200 = 2倍、50 = 半分、0 = ミュート。',
+    volumeApply: '適用',
   },
 };
 
@@ -282,11 +307,24 @@ function parseTimeInput(text, maxSec) {
   return null;
 }
 
-function defaultMergeOutName(fileA, fileB) {
-  const a = (fileA?.name || 'clip1').replace(/\.[^.]+$/i, '') || 'clip1';
-  const b = (fileB?.name || 'clip2').replace(/\.[^.]+$/i, '') || 'clip2';
-  const base = `${a}_${b}`.replace(/[\\/:*?"<>|]/g, '_');
+function createDefaultMergeSlots(count = 2) {
+  return Array.from({ length: count }, () => ({ id: crypto.randomUUID(), file: null }));
+}
+
+function defaultMergeOutName(files) {
+  const parts = files
+    .map((f, i) => (f?.name || `clip${i + 1}`).replace(/\.[^.]+$/i, '') || `clip${i + 1}`)
+    .slice(0, 4);
+  let base = parts.join('_').replace(/[\\/:*?"<>|]/g, '_');
+  if (files.length > 4) base += `_x${files.length}`;
+  if (!base) base = 'merged';
   return /\.mp4$/i.test(base) ? base : `${base}.mp4`;
+}
+
+function mergeSlotLabel(dict, index) {
+  if (index === 0) return t(dict, 'selectVideoStep1');
+  if (index === 1) return t(dict, 'selectVideoStep2');
+  return `${t(dict, 'selectVideoN')} ${index + 1}`;
 }
 
 /**
@@ -350,12 +388,17 @@ export default function App() {
   const [snack, setSnack] = useState({ open: false, message: '' });
 
   const [mergePickerOpen, setMergePickerOpen] = useState(false);
-  const [mergeFileA, setMergeFileA] = useState(null);
-  const [mergeFileB, setMergeFileB] = useState(null);
+  const [mergeSlots, setMergeSlots] = useState(() => createDefaultMergeSlots(2));
   const [mergeSaveOpen, setMergeSaveOpen] = useState(false);
   const [mergeOutFileName, setMergeOutFileName] = useState('');
 
+  const [volumePercent, setVolumePercent] = useState(100);
+  const [volumeDialogOpen, setVolumeDialogOpen] = useState(false);
+  const [volumeDraft, setVolumeDraft] = useState('100');
+
   const exportAbortRef = useRef(null);
+  const audioCtxRef = useRef(null);
+  const gainNodeRef = useRef(null);
   const videoRef = useRef(null);
   const trackRef = useRef(null);
   const flagDragRef = useRef(null);
@@ -380,6 +423,51 @@ export default function App() {
     setFileUrl(u);
     return () => URL.revokeObjectURL(u);
   }, [inputFile]);
+
+  useEffect(() => {
+    audioCtxRef.current = null;
+    gainNodeRef.current = null;
+  }, [inputFile]);
+
+  const setupPlaybackAudio = useCallback((video) => {
+    if (!video || gainNodeRef.current) return;
+    try {
+      const ctx = new AudioContext();
+      const source = ctx.createMediaElementSource(video);
+      const gain = ctx.createGain();
+      source.connect(gain);
+      gain.connect(ctx.destination);
+      audioCtxRef.current = ctx;
+      gainNodeRef.current = gain;
+    } catch {
+      audioCtxRef.current = null;
+      gainNodeRef.current = null;
+    }
+  }, []);
+
+  const applyPlaybackVolume = useCallback((percent) => {
+    const p = normalizeVolumePercent(percent);
+    const gain = volumeGainFromPercent(p);
+    const v = videoRef.current;
+    const gn = gainNodeRef.current;
+    const ctx = audioCtxRef.current;
+
+    if (gn && v) {
+      gn.gain.value = gain;
+      v.muted = p === 0;
+      v.volume = 1;
+      if (ctx?.state === 'suspended') void ctx.resume();
+      return;
+    }
+    if (v) {
+      v.muted = p === 0;
+      v.volume = Math.min(1, gain);
+    }
+  }, []);
+
+  useEffect(() => {
+    applyPlaybackVolume(volumePercent);
+  }, [volumePercent, applyPlaybackVolume, fileUrl]);
 
   const pickOutput = useCallback(async () => {
     if (!supportsDirectoryPicker()) {
@@ -463,8 +551,8 @@ export default function App() {
     const startEdited = editedTimeRef.current;
     const startWall = performance.now();
 
-    v.muted = false;
-    v.volume = 1;
+    setupPlaybackAudio(v);
+    applyPlaybackVolume(volumePercent);
     try {
       v.currentTime = editedToSource(segments, startEdited);
     } catch {
@@ -515,7 +603,7 @@ export default function App() {
       v.pause();
       setEditedTime(editedTimeRef.current);
     };
-  }, [playing, segments, totalEdited, duration, dict]);
+  }, [playing, segments, totalEdited, duration, dict, volumePercent, setupPlaybackAudio, applyPlaybackVolume]);
 
   const onLoadedMetadata = () => {
     const v = videoRef.current;
@@ -633,6 +721,7 @@ export default function App() {
       const data = await exportSegmentsToMp4(ffmpeg, inputFile, segments, {
         signal,
         sourceDuration: duration,
+        volumePercent,
         onLog: (m) => setExportLog(m.slice(-160)),
         onProgress: (t) => setEncodeProgress(Math.round(t * 100)),
       });
@@ -674,12 +763,11 @@ export default function App() {
 
   const openMergePicker = () => {
     if (exporting) return;
-    setMergeFileA(null);
-    setMergeFileB(null);
+    setMergeSlots(createDefaultMergeSlots(2));
     setMergePickerOpen(true);
   };
 
-  const pickMergeFile = (which) => {
+  const pickMergeFile = (index) => {
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = 'video/mp4,.mp4';
@@ -690,19 +778,29 @@ export default function App() {
         setSnack({ open: true, message: t(dict, 'mp4Only') });
         return;
       }
-      if (which === 'a') setMergeFileA(f);
-      else setMergeFileB(f);
+      setMergeSlots((slots) => slots.map((s, i) => (i === index ? { ...s, file: f } : s)));
     };
     input.click();
   };
 
+  const addMergeSlot = () => {
+    setMergeSlots((slots) => [...slots, { id: crypto.randomUUID(), file: null }]);
+  };
+
+  const getMergeFiles = () => mergeSlots.map((s) => s.file).filter(Boolean);
+
   const goMergeSaveStep = async () => {
-    if (!mergeFileA || !mergeFileB) {
+    const files = getMergeFiles();
+    if (files.length < 2) {
       setSnack({ open: true, message: t(dict, 'mergeNeedsTwo') });
       return;
     }
+    if (files.length !== mergeSlots.length) {
+      setSnack({ open: true, message: t(dict, 'mergeNeedsAll') });
+      return;
+    }
     setMergePickerOpen(false);
-    setMergeOutFileName(defaultMergeOutName(mergeFileA, mergeFileB));
+    setMergeOutFileName(defaultMergeOutName(files));
     if (!outputDirHandle) {
       const h = await pickOutput();
       if (!h) {
@@ -714,11 +812,20 @@ export default function App() {
   };
 
   const exportMergedMp4 = async () => {
-    if (!mergeFileA || !mergeFileB || !outputDirHandle) {
+    const files = getMergeFiles();
+    if (!outputDirHandle) {
       setSnack({ open: true, message: t(dict, 'pickSaveFolder') });
       return;
     }
-    const outName = normalizeOutName(mergeOutFileName, defaultMergeOutName(mergeFileA, mergeFileB));
+    if (files.length < 2) {
+      setSnack({ open: true, message: t(dict, 'mergeNeedsTwo') });
+      return;
+    }
+    if (files.length !== mergeSlots.length) {
+      setSnack({ open: true, message: t(dict, 'mergeNeedsAll') });
+      return;
+    }
+    const outName = normalizeOutName(mergeOutFileName, defaultMergeOutName(files));
     exportAbortRef.current = new AbortController();
     const signal = exportAbortRef.current.signal;
 
@@ -735,12 +842,15 @@ export default function App() {
     };
 
     try {
-      const [dimA, dimB] = await Promise.all([probeVideoDimensions(mergeFileA), probeVideoDimensions(mergeFileB)]);
-      const canvas = { width: Math.max(dimA.width, dimB.width), height: Math.max(dimA.height, dimB.height) };
+      const dims = await Promise.all(files.map((f) => probeVideoDimensions(f)));
+      const canvas = {
+        width: Math.max(...dims.map((d) => d.width)),
+        height: Math.max(...dims.map((d) => d.height)),
+      };
 
       ffmpeg = await loadFfmpeg({ onLog: (m) => setExportLog(m.slice(-160)) });
       ffmpeg.on('progress', onProg);
-      const data = await mergeTwoMp4CenterPad(ffmpeg, mergeFileA, mergeFileB, canvas, {
+      const data = await mergeManyMp4CenterPad(ffmpeg, files, canvas, {
         signal,
         onLog: (m) => setExportLog(m.slice(-160)),
         onProgress: (p) => setEncodeProgress(Math.round(p * 100)),
@@ -751,8 +861,7 @@ export default function App() {
       await writeFileToDirectory(outputDirHandle, outName, data, { signal });
       setSnack({ open: true, message: `${t(dict, 'mergeSaved')} ${outName}` });
       setMergeSaveOpen(false);
-      setMergeFileA(null);
-      setMergeFileB(null);
+      setMergeSlots(createDefaultMergeSlots(2));
     } catch (err) {
       if (ffmpeg) {
         try {
@@ -852,6 +961,19 @@ export default function App() {
             <Tooltip title={t(dict, 'exclusiveDelete')}><IconButton size="small" color="warning" onClick={applyExclusiveDelete} disabled={flagStart == null || flagEnd == null}><DeleteOutsideIcon /></IconButton></Tooltip>
             <Tooltip title={t(dict, 'openSaveDialog')}><IconButton size="small" color="primary" onClick={openSaveDialog} disabled={exporting || !inputFile || !segments.length}><SaveIcon /></IconButton></Tooltip>
             <Tooltip title={t(dict, 'mergeVideos')}><IconButton size="small" color="secondary" onClick={openMergePicker} disabled={exporting}><MergeVideosIcon /></IconButton></Tooltip>
+            <Tooltip title={`${t(dict, 'volume')}: ${volumePercent}%`}>
+              <IconButton
+                size="small"
+                onClick={() => {
+                  setVolumeDraft(String(volumePercent));
+                  setVolumeDialogOpen(true);
+                }}
+                disabled={exporting}
+                color={volumePercent === 0 ? 'default' : volumePercent === 100 ? 'default' : 'primary'}
+              >
+                <VolumeIcon />
+              </IconButton>
+            </Tooltip>
             <Tooltip title={t(dict, 'language')}><IconButton size="small" onClick={() => setLangDialogOpen(true)}><LanguageIcon /></IconButton></Tooltip>
           </Stack>
 
@@ -1011,13 +1133,30 @@ export default function App() {
 
       <Dialog open={mergePickerOpen} onClose={() => !exporting && setMergePickerOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>{t(dict, 'mergePickerTitle')}</DialogTitle>
-        <DialogContent>
-          <Stack spacing={2} sx={{ mt: 1 }}>
-            <Button variant="outlined" onClick={() => pickMergeFile('a')} disabled={exporting}>{t(dict, 'selectVideoStep1')}</Button>
-            <Typography variant="body2" color="text.secondary">{mergeFileA ? mergeFileA.name : '—'}</Typography>
-            <Button variant="outlined" onClick={() => pickMergeFile('b')} disabled={exporting}>{t(dict, 'selectVideoStep2')}</Button>
-            <Typography variant="body2" color="text.secondary">{mergeFileB ? mergeFileB.name : '—'}</Typography>
-          </Stack>
+        <DialogContent dividers sx={{ p: 0 }}>
+          <Box sx={{ maxHeight: 360, overflowY: 'auto', px: 2, py: 1.5 }}>
+            <Stack spacing={2}>
+              {mergeSlots.map((slot, index) => (
+                <Stack key={slot.id} spacing={0.5}>
+                  <Button variant="outlined" fullWidth onClick={() => pickMergeFile(index)} disabled={exporting}>
+                    {mergeSlotLabel(dict, index)}
+                  </Button>
+                  <Typography variant="body2" color="text.secondary" sx={{ wordBreak: 'break-all' }}>
+                    {slot.file ? slot.file.name : '—'}
+                  </Typography>
+                </Stack>
+              ))}
+              <Button
+                variant="outlined"
+                fullWidth
+                startIcon={<AddIcon />}
+                onClick={addMergeSlot}
+                disabled={exporting}
+              >
+                {t(dict, 'mergeAddVideo')}
+              </Button>
+            </Stack>
+          </Box>
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setMergePickerOpen(false)} disabled={exporting}>{t(dict, 'cancel')}</Button>
@@ -1039,6 +1178,46 @@ export default function App() {
         <DialogActions>
           <Button onClick={() => setMergeSaveOpen(false)} disabled={exporting}>{t(dict, 'cancel')}</Button>
           <Button variant="contained" onClick={() => { void exportMergedMp4(); }} disabled={exporting || !outputDirHandle}>{t(dict, 'save')}</Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={volumeDialogOpen} onClose={() => setVolumeDialogOpen(false)} maxWidth="xs" fullWidth>
+        <DialogTitle>{t(dict, 'volumeTitle')}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <TextField
+              label={t(dict, 'volume')}
+              type="number"
+              size="small"
+              fullWidth
+              inputProps={{ min: 0, max: 200, step: 1 }}
+              value={volumeDraft}
+              onChange={(e) => setVolumeDraft(e.target.value)}
+              helperText={t(dict, 'volumeHint')}
+            />
+            <Slider
+              size="small"
+              min={0}
+              max={200}
+              step={1}
+              value={Math.min(200, Math.max(0, Number(volumeDraft) || 0))}
+              onChange={(_, v) => setVolumeDraft(String(Array.isArray(v) ? v[0] : v))}
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setVolumeDialogOpen(false)}>{t(dict, 'cancel')}</Button>
+          <Button
+            variant="contained"
+            onClick={() => {
+              const p = normalizeVolumePercent(volumeDraft);
+              setVolumePercent(p);
+              setVolumeDraft(String(p));
+              setVolumeDialogOpen(false);
+            }}
+          >
+            {t(dict, 'volumeApply')}
+          </Button>
         </DialogActions>
       </Dialog>
 

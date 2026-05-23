@@ -80,6 +80,22 @@ export function LanguageIcon(props) {
   );
 }
 
+export function VolumeIcon(props) {
+  return (
+    <SvgIcon {...props}>
+      <path d="M3 10v4h4l5 5V5L7 10H3zm13.5 2c0-1.77-1.02-3.29-2.5-4.03v8.06c1.48-.74 2.5-2.26 2.5-4.03zM14 4.45v2.17c2.36.77 4 3.05 4 5.83s-1.64 5.06-4 5.83v2.17c3.39-1.07 6-4.24 6-8 0-3.76-2.61-6.93-6-7.55z" />
+    </SvgIcon>
+  );
+}
+
+export function AddIcon(props) {
+  return (
+    <SvgIcon {...props}>
+      <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" />
+    </SvgIcon>
+  );
+}
+
 export function MergeVideosIcon(props) {
   return (
     <SvgIcon {...props}>

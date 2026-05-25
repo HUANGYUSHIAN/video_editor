@@ -81,20 +81,6 @@ function normalizeSegments(segments) {
 }
 
 /**
- * Stream copy (-c copy) only cuts on keyframes. Short edits (e.g. ~2s) often fall
- * inside one GOP, so the removed range still appears in the exported file.
- */
-export function needsFrameAccurateExport(sorted, sourceDuration = 0) {
-  if (sorted.length > 1) return true;
-  if (sorted.length === 1) {
-    const s = sorted[0];
-    if (s.start > 0.01) return true;
-    if (sourceDuration > 0 && s.end < sourceDuration - 0.01) return true;
-  }
-  return false;
-}
-
-/**
  * @param {import('@ffmpeg/ffmpeg').FFmpeg} ffmpeg
  * @param {string} name
  */
@@ -332,7 +318,6 @@ export async function exportSegmentsToMp4(ffmpeg, file, segments, opts = {}) {
 
   const wmvLike =
     /\.(wmv|asf)$/i.test(file.name) || /wmv|ms-asf/i.test(file.type || '');
-  const frameAccurate = needsFrameAccurateExport(sorted, sourceDuration);
   const volumeGain = volumeGainFromPercent(opts.volumePercent ?? 100);
   const needsVolume = volumeGain !== 1;
   const needsScale = needsScaleExport(
@@ -352,8 +337,8 @@ export async function exportSegmentsToMp4(ffmpeg, file, segments, opts = {}) {
   };
 
   try {
-    if (wmvLike || frameAccurate || needsVolume || needsScale) {
-      if (needsScale && !wmvLike && !frameAccurate && !needsVolume) {
+    if (wmvLike || needsVolume || needsScale) {
+      if (needsScale && !wmvLike && !needsVolume) {
         const dims = computeScaledDimensions(
           sourceVideoWidth,
           sourceVideoHeight,
@@ -361,10 +346,8 @@ export async function exportSegmentsToMp4(ffmpeg, file, segments, opts = {}) {
         );
         const sizeText = dims ? `${dims.width}×${dims.height}` : '縮放';
         opts.onLog?.(`長邊縮至 ${outputMaxEdge}px（${sizeText}）並匯出…`);
-      } else if (needsVolume && !wmvLike && !frameAccurate) {
+      } else if (needsVolume && !wmvLike) {
         opts.onLog?.('套用音量調整，使用重編碼匯出…');
-      } else if (frameAccurate && !wmvLike) {
-        opts.onLog?.('使用精確裁切匯出（有刪除片段時無法僅串流複製）…');
       } else {
         opts.onLog?.('WMV/ASF 無法串流複製成 MP4，直接重編碼匯出…');
       }
